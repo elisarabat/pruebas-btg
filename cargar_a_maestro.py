@@ -9,6 +9,8 @@ import pandas as pd
 import sys
 import os
 import unicodedata
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 
 
@@ -220,6 +222,19 @@ def _rut_valor_a_str(val) -> str:
     return s.replace(".", "")
 
 
+def _normalizar_fecha_str(val) -> str:
+    """Normaliza un valor de fecha a string YYYY-MM-DD para comparación de duplicados."""
+    if pd.isna(val):
+        return ""
+    try:
+        dt = pd.to_datetime(val, dayfirst=True, errors="coerce")
+        if pd.isna(dt):
+            return ""
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
 def _normalizar_rut_para_merge(val) -> str:
     """
     Normaliza un RUT para comparación: quita puntos y deja formato '12345678-9'.
@@ -317,7 +332,7 @@ def mapear_columnas_fuente_a_maestro(df_fuente: pd.DataFrame) -> dict:
                 "nombres": ["nombres", "nombre completo"],
                 "rut": ["rut", "run", "rut cliente"],
                 "dv": ["dv", "digito verificador"],
-                "fecha de emision": ["fecha emision", "fecha_emision", "fecha emisión"],
+                "fecha de emision": ["fecha emision", "fecha_emision", "fecha emisión", "fecha de emision", "fecha de suscripcion"],
                 "monto credito + cap (uf)": [
                     "monto credito + cap (uf)", "monto credito - cap (uf)",
                     "monto credito uf", "credito uf", "monto cap",
@@ -329,14 +344,14 @@ def mapear_columnas_fuente_a_maestro(df_fuente: pd.DataFrame) -> dict:
                 "morosidad": ["morosidad", "dias morosidad"],
                 "n° cuotas": ["n cuotas", "numero cuotas", "cuotas", "nº cuotas"],
                 "cuota mes": ["cuota mes", "cuota", "cuota mensual", "primera cuota a endosar"],
-                "tasa arriendo o compra": ["tasa arriendo", "tasa compra", "tasa"],
+                "tasa arriendo o compra": ["tasa arriendo", "tasa compra", "tasa de compra", "tasa anual de emision", "tasa"],
                 "fecha 1er aporte": ["fecha primer aporte", "1er aporte", "fecha 1er aporte", "fecha 1er aporte a endosar"],
                 "fecha last aporte": ["fecha ultimo aporte", "fecha ultimo aporte a endosar", "last aporte", "fecha last aporte"],
                 "fecha corte": ["fecha corte", "fecha de corte", "corte"],
                 "saldo insoluto teorico al 31-07-2019": ["saldo insoluto teorico", "saldo insoluto", "saldo teorico", "saldo 31-07-2019"],
                 "tasacion": ["tasacion", "tasación", "valor tasacion", "tasacion de la propiedad"],
                 "precio venta/tasacion": ["precio venta", "precio tasacion", "precio venta tasacion", "precio venta/tasacion"],
-                "tasa venta": ["tasa venta", "tasa_venta"],
+                "tasa venta": ["tasa venta", "tasa_venta", "tasa de venta", "tasa de endoso", "tasa anual de endoso", "tasa endoso"],
                 "dif. tasa": ["dif tasa", "diferencia tasa", "dif tasa"],
                 "monto dividendo": ["monto dividendo", "dividendo", "monto dividendo"],
                 "div/renta": ["div/renta", "divrenta", "dividendo/renta", "dividendo/ renta"],
@@ -410,6 +425,29 @@ def mapear_columnas_fuente_a_maestro(df_fuente: pd.DataFrame) -> dict:
                 if candidatos:
                     mejor = max(candidatos, key=lambda x: len(x[0]))
                     mapeo[col_maestro] = mejor[1]
+            # Fallback por palabra clave: buscar columnas cuyo nombre CONTIENE las
+            # palabras esenciales (para nombres variables como "Morosidad al 10-03-21")
+            if col_maestro not in mapeo:
+                palabras_clave = {
+                    "morosidad": [["morosidad"]],
+                    "saldo insoluto teorico al 31-07-2019": [["saldo", "insoluto"]],
+                    "fecha de emision": [["fecha", "emision"], ["fecha", "suscripcion"]],
+                    "tasa arriendo o compra": [["tasa", "compra"], ["tasa", "arriendo"], ["tasa", "emision"]],
+                    "tasa venta": [["tasa", "venta"], ["tasa", "endoso"]],
+                    "precio venta/tasacion": [["precio", "venta"]],
+                    "carga financiera": [["carga", "financiera"]],
+                    "monto credito + cap (uf)": [["monto", "credito"]],
+                }
+                if norm_maestro in palabras_clave:
+                    for grupo_kw in palabras_clave[norm_maestro]:
+                        candidatos = [
+                            (k, normalizados_fuente[k]) for k in normalizados_fuente
+                            if all(kw in k for kw in grupo_kw)
+                        ]
+                        if candidatos:
+                            mejor = max(candidatos, key=lambda x: len(x[0]))
+                            mapeo[col_maestro] = mejor[1]
+                            break
             # Fallback por índice: columnas del fuente con encabezado vacío (Unnamed)
             if col_maestro not in mapeo and col_maestro in COLUMNAS_POR_INDICE_FUENTE:
                 idx = COLUMNAS_POR_INDICE_FUENTE[col_maestro]
@@ -569,11 +607,88 @@ def _leer_valo_con_filas_2_y_3(ruta_fuente: str) -> pd.DataFrame:
     return df_fuente
 
 
+def _leer_maestro_como_dataframe(ruta_maestro: str) -> pd.DataFrame:
+    """
+    Lee el maestro construyendo los encabezados desde filas 1 y 2 (pueden estar
+    en celdas combinadas). Para cada columna usa el valor de fila 2 si existe,
+    si no el de fila 1. Los datos empiezan en fila 3.
+    Devuelve un DataFrame con columnas estandarizadas a COLUMNAS_MAESTRO.
+    """
+    df_raw = pd.read_excel(ruta_maestro, sheet_name=0, header=None)
+    if df_raw.empty or len(df_raw) < 3:
+        return pd.DataFrame(columns=COLUMNAS_MAESTRO)
+    row1 = df_raw.iloc[0]
+    row2 = df_raw.iloc[1]
+    n_cols = min(len(df_raw.columns), len(COLUMNAS_MAESTRO) + 10)
+    headers = []
+    for i in range(n_cols):
+        v2 = row2.iloc[i] if i < len(row2) else None
+        v1 = row1.iloc[i] if i < len(row1) else None
+        if pd.notna(v2) and str(v2).strip():
+            headers.append(str(v2).strip())
+        elif pd.notna(v1) and str(v1).strip():
+            headers.append(str(v1).strip())
+        else:
+            headers.append(f"Unnamed: {i}")
+    df = df_raw.iloc[2:, :n_cols].copy()
+    df.columns = headers
+    df.reset_index(drop=True, inplace=True)
+    return _maestro_a_columnas_estandar(df)
+
+
+def _es_na(val) -> bool:
+    """Verifica si un valor es NA/NaN/NaT de forma segura."""
+    try:
+        return pd.isna(val)
+    except (ValueError, TypeError):
+        return False
+
+
+_ALINEACION_CENTRO = Alignment(horizontal="center", vertical="center")
+
+
+def _escribir_celda(ws, fila, col_idx, col_name, val, columnas_porcentaje, columnas_fecha):
+    """Escribe un valor en una celda de Excel con el formato correcto y centrado."""
+    cell = ws.cell(row=fila, column=col_idx)
+
+    if _es_na(val):
+        cell.alignment = _ALINEACION_CENTRO
+        return
+
+    if col_name in columnas_porcentaje:
+        num_val = val if isinstance(val, (int, float)) else pd.to_numeric(val, errors="coerce")
+        if isinstance(num_val, (int, float)) and not _es_na(num_val):
+            if abs(num_val) > 1:
+                num_val = num_val / 100
+            cell.value = num_val
+            cell.number_format = "0.00%"
+        cell.alignment = _ALINEACION_CENTRO
+        return
+
+    if col_name in columnas_fecha:
+        if isinstance(val, pd.Timestamp):
+            cell.value = val.to_pydatetime()
+        elif hasattr(val, "to_pydatetime"):
+            cell.value = val.to_pydatetime()
+        else:
+            try:
+                cell.value = pd.to_datetime(val, dayfirst=True).to_pydatetime()
+            except Exception:
+                cell.value = val
+        cell.number_format = "dd/mm/yyyy"
+        cell.alignment = _ALINEACION_CENTRO
+        return
+
+    cell.value = val
+    cell.alignment = _ALINEACION_CENTRO
+
+
 def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra: str = None) -> None:
     """
-    Lee el archivo fuente, lo mapea al formato maestro, lo concatena al maestro
-    y guarda el maestro sin duplicados (llave: Rut + Fecha de emisión).
-    Si se indica fecha_compra, se usa para todas las filas nuevas (sustituye al archivo fuente).
+    Lee el archivo fuente, lo mapea al formato maestro y AGREGA las filas nuevas
+    al maestro existente sin tocar las filas ya presentes.
+    Evita duplicados por Rut + Fecha de emisión.
+    Si se indica fecha_compra, se usa para todas las filas nuevas.
     """
     if not os.path.isfile(ruta_fuente):
         raise FileNotFoundError(f"No se encontró el archivo fuente: {ruta_fuente}")
@@ -595,7 +710,7 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
     try:
         df_base = pd.read_excel(ruta_fuente, sheet_name=HOJA_BASE, header=FILA_ENCABEZADO_BASE)
     except ValueError:
-        pass  # No hay hoja Base o tiene otro nombre
+        pass
 
     # Mapeo y reporte
     mapeo = mapear_columnas_fuente_a_maestro(df_fuente)
@@ -615,89 +730,160 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
     # Calcular columnas derivadas DESPUÉS de rellenar desde Base
     aplicar_columnas_calculadas(df_nuevo)
 
-    # Fecha de compra como input: se aplica a todas las filas nuevas
+    # Saldo insoluto: si está vacío, rellenar con 0
+    col_saldo = "Saldo insoluto Teorico al 31-07-2019"
+    if col_saldo in df_nuevo.columns:
+        df_nuevo[col_saldo] = pd.to_numeric(df_nuevo[col_saldo], errors="coerce").fillna(0)
+
+    # Fecha de compra como input
     if fecha_compra is not None and fecha_compra.strip():
-        df_nuevo["Fecha de compra"] = fecha_compra.strip()
-
-    # Leer maestro existente (los nombres de columna están en la fila 2 del Excel)
-    if os.path.isfile(ruta_maestro):
-        df_maestro_raw = pd.read_excel(ruta_maestro, sheet_name=0, header=1)
-        # Mapear por nombre normalizado para no perder datos de filas ya existentes
-        # (si el Excel tiene "Comuna " o "Morosidad " con espacio, se reconoce igual)
-        df_maestro = _maestro_a_columnas_estandar(df_maestro_raw)
-    else:
-        df_maestro = pd.DataFrame(columns=COLUMNAS_MAESTRO)
-
-    # Unir
-    df_combinado = pd.concat([df_maestro, df_nuevo], ignore_index=True)
-
-    # Normalizar llave para deduplicar (Rut + Fecha de emisión)
-    def _normalizar_fecha_str(val):
-        if pd.isna(val):
-            return ""
         try:
-            return pd.to_datetime(val, dayfirst=True, errors="coerce").strftime("%Y-%m-%d")
-        except Exception:
-            return str(val).strip()
+            df_nuevo["Fecha de compra"] = pd.to_datetime(fecha_compra.strip(), dayfirst=True)
+        except (ValueError, TypeError):
+            df_nuevo["Fecha de compra"] = fecha_compra.strip()
 
-    def llave(r):
-        rut_val = r["Rut"]
-        fec_val = r["Fecha de emisión"]
-        rut = _rut_valor_a_str(rut_val) if pd.notna(rut_val) else ""
-        fec = _normalizar_fecha_str(fec_val)
-        return (rut, fec)
+    # Normalizar todas las columnas de fecha del nuevo DataFrame
+    for col in COLUMNAS_FECHA:
+        if col in df_nuevo.columns:
+            df_nuevo[col] = pd.to_datetime(df_nuevo[col], dayfirst=True, errors="coerce")
 
-    df_combinado["_llave_"] = df_combinado.apply(llave, axis=1)
-    # No deduplicar filas donde Rut o Fecha de emisión están vacíos
-    tiene_llave = df_combinado["_llave_"].apply(lambda x: x[0] != "" and x[1] != "")
-    df_con_llave = df_combinado[tiene_llave].drop_duplicates(subset=["_llave_"], keep="first")
-    df_sin_llave = df_combinado[~tiene_llave]
-    df_sin_duplicados = pd.concat([df_con_llave, df_sin_llave], ignore_index=True)
-    df_sin_duplicados = df_sin_duplicados.drop(columns=["_llave_"])
+    COLUMNAS_PORCENTAJE = ("Tasa Arriendo o Compra", "Tasa Venta", "Dif. Tasa", "Precio Venta/Tasación")
 
-    # Reordenar por si acaso
-    df_sin_duplicados = df_sin_duplicados[COLUMNAS_MAESTRO]
+    maestro_existe = os.path.isfile(ruta_maestro)
 
-    # Fecha de emisión: solo fecha, sin hora
-    if "Fecha de emisión" in df_sin_duplicados.columns:
-        df_sin_duplicados["Fecha de emisión"] = (
-            pd.to_datetime(df_sin_duplicados["Fecha de emisión"], errors="coerce").dt.normalize()
-        )
+    if maestro_existe:
+        # --- MODO APPEND: solo agregar filas nuevas, nunca tocar las existentes ---
 
-    # Columnas de tasa que deben mostrarse en porcentaje (Tasa endoso = Tasa Venta; Tasa Arriendo también)
-    COLUMNAS_PORCENTAJE = ("Tasa Arriendo o Compra", "Tasa Venta", "Dif. Tasa")
+        # Leer maestro SOLO para obtener llaves de deduplicación.
+        # Las cabeceras pueden estar en fila 1 o 2 (celdas combinadas).
+        df_maestro_std = _leer_maestro_como_dataframe(ruta_maestro)
+        n_antes = len(df_maestro_std)
 
-    # Guardar (cabecera en fila 2 para mantener formato del maestro)
-    with pd.ExcelWriter(ruta_maestro, engine="openpyxl") as writer:
-        df_sin_duplicados.to_excel(writer, index=False, sheet_name="Sheet1", startrow=1)
-        ws = writer.sheets["Sheet1"]
-        n_filas = len(df_sin_duplicados)
-        fila_inicio_datos = 3  # startrow=1 → header fila 2, datos desde fila 3
-        fila_fin_datos = fila_inicio_datos + n_filas  # exclusive
-        for col_name in COLUMNAS_PORCENTAJE:
-            if col_name not in df_sin_duplicados.columns:
-                continue
-            col_idx = df_sin_duplicados.columns.get_loc(col_name) + 1
-            col_letter = get_column_letter(col_idx)
-            for row in range(fila_inicio_datos, fila_fin_datos):
-                cell = ws[f"{col_letter}{row}"]
-                val = cell.value
-                if isinstance(val, (int, float)) and not pd.isna(val):
-                    if abs(val) > 1:
-                        cell.value = val / 100
-                    cell.number_format = "0.00%"
-        for col_name in COLUMNAS_FECHA:
-            if col_name not in df_sin_duplicados.columns:
-                continue
-            col_idx = df_sin_duplicados.columns.get_loc(col_name) + 1
-            col_letter = get_column_letter(col_idx)
-            for row in range(fila_inicio_datos, fila_fin_datos):
-                ws[f"{col_letter}{row}"].number_format = "dd/mm/yyyy"
-    print(f"Maestro actualizado: {ruta_maestro}")
-    print(f"  Filas en maestro antes: {len(df_maestro)}")
-    print(f"  Filas nuevas leídas: {len(df_nuevo)}")
-    print(f"  Duplicados eliminados: {len(df_combinado) - len(df_sin_duplicados)}")
-    print(f"  Total filas en maestro ahora: {len(df_sin_duplicados)}")
+        llaves_existentes = set()
+        for _, r in df_maestro_std.iterrows():
+            rut = _rut_valor_a_str(r["Rut"]) if not _es_na(r.get("Rut")) else ""
+            fec = _normalizar_fecha_str(r.get("Fecha de emisión"))
+            if rut and fec:
+                llaves_existentes.add((rut, fec))
+
+        def _es_duplicado(r):
+            rut = _rut_valor_a_str(r["Rut"]) if not _es_na(r.get("Rut")) else ""
+            fec = _normalizar_fecha_str(r.get("Fecha de emisión"))
+            if not rut or not fec:
+                return False
+            return (rut, fec) in llaves_existentes
+
+        mask_dup = df_nuevo.apply(_es_duplicado, axis=1)
+        df_a_agregar = df_nuevo[~mask_dup].copy()
+        n_duplicados = int(mask_dup.sum())
+
+        if df_a_agregar.empty:
+            print("No hay filas nuevas para agregar (todas ya existen en el maestro).")
+            return
+
+        # Abrir el archivo existente y agregar al final
+        wb = load_workbook(ruta_maestro)
+        ws = wb.active
+
+        # Leer cabeceras: pueden estar en fila 1, fila 2 o celdas combinadas
+        n_maestro_cols = len(COLUMNAS_MAESTRO)
+        max_scan = min(ws.max_column, n_maestro_cols + 10)
+        col_pos = {}
+        for ci in range(1, max_scan + 1):
+            v1 = ws.cell(row=1, column=ci).value
+            v2 = ws.cell(row=2, column=ci).value
+            val = v2 if v2 is not None else v1
+            if val is not None:
+                norm_val = normalizar_nombre(str(val))
+                for cm in COLUMNAS_MAESTRO:
+                    if cm not in col_pos and normalizar_nombre(cm) == norm_val:
+                        col_pos[cm] = ci
+                        break
+        # Fallback posicional: si una columna no se mapeó por nombre, usar su
+        # posición en COLUMNAS_MAESTRO (el maestro tiene ese orden exacto)
+        for i, cm in enumerate(COLUMNAS_MAESTRO):
+            if cm not in col_pos and (i + 1) <= max_scan:
+                col_pos[cm] = i + 1
+
+        print(f"  Columnas mapeadas en maestro: {len(col_pos)}/{n_maestro_cols}")
+
+        siguiente_fila = ws.max_row + 1
+
+        # Obtener el último N° del maestro para continuar la enumeración
+        ultimo_n = 0
+        if "N°" in col_pos:
+            col_n = col_pos["N°"]
+            for fila_r in range(ws.max_row, 2, -1):
+                val_n = ws.cell(row=fila_r, column=col_n).value
+                if val_n is not None:
+                    try:
+                        ultimo_n = int(val_n)
+                    except (ValueError, TypeError):
+                        pass
+                    break
+
+        for i, (_, row) in enumerate(df_a_agregar.iterrows()):
+            fila_excel = siguiente_fila + i
+            for col_name in COLUMNAS_MAESTRO:
+                if col_name not in col_pos:
+                    continue
+                if col_name == "N°":
+                    val = ultimo_n + i + 1
+                else:
+                    val = row.get(col_name)
+                _escribir_celda(
+                    ws, fila_excel, col_pos[col_name], col_name, val,
+                    COLUMNAS_PORCENTAJE, COLUMNAS_FECHA,
+                )
+
+        wb.save(ruta_maestro)
+
+        print(f"Maestro actualizado: {ruta_maestro}")
+        print(f"  Filas en maestro antes: {n_antes}")
+        print(f"  Filas nuevas leídas:    {len(df_nuevo)}")
+        print(f"  Duplicados (ya existían): {n_duplicados}")
+        print(f"  Filas agregadas:        {len(df_a_agregar)}")
+        print(f"  Total filas en maestro: {n_antes + len(df_a_agregar)}")
+
+    else:
+        # --- MODO CREAR: no existe maestro, crear uno nuevo ---
+        # Asignar N° correlativo empezando desde 1
+        if "N°" in df_nuevo.columns:
+            df_nuevo["N°"] = range(1, len(df_nuevo) + 1)
+
+        with pd.ExcelWriter(ruta_maestro, engine="openpyxl") as writer:
+            df_nuevo.to_excel(writer, index=False, sheet_name="Sheet1", startrow=1)
+            ws = writer.sheets["Sheet1"]
+            n_filas = len(df_nuevo)
+            fila_inicio = 3
+            fila_fin = fila_inicio + n_filas
+            n_cols = len(df_nuevo.columns)
+            for col_name in COLUMNAS_PORCENTAJE:
+                if col_name not in df_nuevo.columns:
+                    continue
+                col_idx = df_nuevo.columns.get_loc(col_name) + 1
+                col_letter = get_column_letter(col_idx)
+                for row in range(fila_inicio, fila_fin):
+                    cell = ws[f"{col_letter}{row}"]
+                    val = cell.value
+                    if isinstance(val, (int, float)) and not _es_na(val):
+                        if abs(val) > 1:
+                            cell.value = val / 100
+                        cell.number_format = "0.00%"
+            for col_name in COLUMNAS_FECHA:
+                if col_name not in df_nuevo.columns:
+                    continue
+                col_idx = df_nuevo.columns.get_loc(col_name) + 1
+                col_letter = get_column_letter(col_idx)
+                for row in range(fila_inicio, fila_fin):
+                    ws[f"{col_letter}{row}"].number_format = "dd/mm/yyyy"
+            # Centrar todas las celdas de datos
+            for row in range(fila_inicio, fila_fin):
+                for ci in range(1, n_cols + 1):
+                    ws.cell(row=row, column=ci).alignment = _ALINEACION_CENTRO
+
+        print(f"Maestro creado: {ruta_maestro}")
+        print(f"  Filas: {len(df_nuevo)}")
 
 
 def main():
