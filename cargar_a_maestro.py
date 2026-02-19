@@ -9,6 +9,7 @@ import pandas as pd
 import sys
 import os
 import unicodedata
+from openpyxl.utils import get_column_letter
 
 
 # Columnas del maestro que se calculan desde otras (no vienen del archivo fuente)
@@ -21,6 +22,13 @@ COLUMNAS_DESDE_FECHA = ("VPN 1ra fecha", "VPN 2da fecha", "Precio -1UF")
 # Hojas del Excel fuente: datos principales y hoja auxiliar
 HOJA_VALO = "Valo"
 HOJA_BASE = "Base"
+# Fila donde están los nombres de columna en el archivo fuente (0 = primera fila)
+FILA_ENCABEZADO_VALO = 2   # fila 3 en Excel (o ver USAR_FILAS_2_Y_3_VALO)
+FILA_ENCABEZADO_BASE = 0   # fila 1 en Excel
+# Si True, en la hoja Valo los nombres de columna se construyen desde filas 2 y 3:
+# para cada columna se usa el valor de la fila 3 si no está vacío, si no el de la fila 2.
+# Así las columnas que solo tienen título en la fila 2 dejan de salir como "Unnamed".
+USAR_FILAS_2_Y_3_VALO = True
 # Llave para enlazar filas de Valo con Base (debe existir en ambas). Si en Base tiene otro nombre, ponlo en COLUMNA_LLAVE_EN_BASE.
 LLAVE_PARA_BASE = "Rut"
 COLUMNA_LLAVE_EN_BASE = None  # None = buscar columna con mismo nombre normalizado en Base
@@ -29,6 +37,22 @@ COLUMNAS_DESDE_BASE = {
     "Fecha de emisión": "Fecha de suscripción",
     "Tasa Arriendo o Compra": "Tasa anual de emisión",
     "Tasa Venta": "Tasa anual de endoso",
+}
+
+# Mapeo por índice cuando la columna en el fuente tiene nombre vacío (Unnamed).
+# Si USAR_FILAS_2_Y_3_VALO = True, muchas de estas columnas ya tendrán nombre (desde la fila 2)
+# y no hará falta listarlas aquí. Este dict es fallback por si alguna sigue sin coincidir.
+# Clave = columna en el maestro; valor = índice 0-based en la hoja Valo.
+COLUMNAS_POR_INDICE_FUENTE = {
+    "Monto Crédito + Cap (UF)": 8,
+    "Fecha 1er Aporte": 15,
+    "Fecha Last Aporte": 16,
+    "Fecha Corte": 17,
+    "Tasacion": 23,
+    "Precio Venta/Tasación": 24,
+    "Monto dividendo": 25,
+    "Div/Renta": 26,
+    "Carga Financiera": 27,
 }
 
 # Columnas del archivo maestro (orden exacto)
@@ -43,7 +67,7 @@ COLUMNAS_MAESTRO = [
     "Rut",
     "DV",
     "Fecha de emisión",
-    "Monto Crédito - Cap (UF)",
+    "Monto Crédito + Cap (UF)",
     "Subsidio",
     "Pie",
     "Valor Vivienda",
@@ -63,7 +87,7 @@ COLUMNAS_MAESTRO = [
     "Tasa Venta",
     "Dif. Tasa",
     "Monto dividendo",
-    "DivRenta",
+    "Div/Renta",
     "Carga Financiera",
     "Dirección",
     "Comuna",
@@ -92,13 +116,16 @@ def _parsear_nombre_como_fecha(nombre) -> pd.Timestamp | None:
     if pd.isna(nombre) or str(nombre).strip() == "":
         return None
     s = str(nombre).strip()
-    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%y", "%d/%m/%y"):
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%y", "%d/%m/%y",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
         try:
             return pd.to_datetime(s, format=fmt)
         except (ValueError, TypeError):
             continue
     try:
         return pd.to_datetime(s, dayfirst=True)
+    except (ValueError, TypeError):
+        return None
     except (ValueError, TypeError):
         return None
 
@@ -129,6 +156,12 @@ def normalizar_nombre(col: str) -> str:
     s = str(col).strip().lower()
     s = unicodedata.normalize("NFD", s)
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    # Unificar variantes de ordinales (1.er, 1 er, 1ª -> 1er)
+    s = s.replace("1.er", "1er").replace("1 er", "1er").replace("1. er", "1er")
+    s = s.replace("1.ª", "1").replace("1ª", "1")
+    # Unificar signos +/− (full-width, minus sign Unicode) y colapsar espacios
+    s = s.replace("＋", "+").replace("－", "-").replace("−", "-")
+    s = " ".join(s.split())
     return s
 
 
@@ -238,7 +271,11 @@ def mapear_columnas_fuente_a_maestro(df_fuente: pd.DataFrame) -> dict:
                 "rut": ["rut", "run", "rut cliente"],
                 "dv": ["dv", "digito verificador"],
                 "fecha de emision": ["fecha emision", "fecha_emision", "fecha emisión"],
-                "monto credito + cap (uf)": ["monto credito + cap (uf)", "monto credito uf", "credito uf", "monto cap"],
+                "monto credito + cap (uf)": [
+                    "monto credito + cap (uf)", "monto credito - cap (uf)",
+                    "monto credito uf", "credito uf", "monto cap",
+                    "monto credito+cap (uf)", "monto credito + cap(uf)",
+                ],
                 "subsidio": ["subsidio"],
                 "pie": ["pie", "pie inicial"],
                 "valor vivienda": ["valor vivienda", "valor_vivienda", "valor propiedad"],
@@ -247,15 +284,16 @@ def mapear_columnas_fuente_a_maestro(df_fuente: pd.DataFrame) -> dict:
                 "cuota mes": ["cuota mes", "cuota", "cuota mensual", "primera cuota a endosar"],
                 "tasa arriendo o compra": ["tasa arriendo", "tasa compra", "tasa"],
                 "fecha 1er aporte": ["fecha primer aporte", "1er aporte", "fecha 1er aporte", "fecha 1er aporte a endosar"],
-                "fecha last aporte": ["fecha ultimo aporte", "last aporte", "fecha last aporte"],
-                "fecha corte": ["fecha corte", "corte"],
-                "saldo insoluto teorico al 31-07-2019": ["saldo insoluto", "saldo teorico", "saldo 31-07-2019"],
-                "tasacion": ["tasacion", "tasación"],
+                "fecha last aporte": ["fecha ultimo aporte", "fecha ultimo aporte a endosar", "last aporte", "fecha last aporte"],
+                "fecha corte": ["fecha corte", "fecha de corte", "corte"],
+                "saldo insoluto teorico al 31-07-2019": ["saldo insoluto teorico", "saldo insoluto", "saldo teorico", "saldo 31-07-2019"],
+                "tasacion": ["tasacion", "tasación", "valor tasacion", "tasacion de la propiedad"],
                 "precio venta/tasacion": ["precio venta", "precio tasacion", "precio venta tasacion", "precio venta/tasacion"],
                 "tasa venta": ["tasa venta", "tasa_venta"],
                 "dif. tasa": ["dif tasa", "diferencia tasa", "dif tasa"],
                 "monto dividendo": ["monto dividendo", "dividendo", "monto dividendo"],
-                "div/renta": ["div/renta", "divrenta", "dividendo/renta"],
+                "div/renta": ["div/renta", "divrenta", "dividendo/renta", "dividendo/ renta"],
+                "divrenta": ["div/renta", "divrenta", "dividendo/renta", "dividendo/ renta"],
                 "carga financiera": ["carga financiera", "carga_financiera", "carga financiera/ renta"],
                 "direccion": ["direccion", "dirección", "domicilio", "direccion de la propiedad"],
                 "comuna": ["comuna"],
@@ -266,6 +304,60 @@ def mapear_columnas_fuente_a_maestro(df_fuente: pd.DataFrame) -> dict:
                     if variante in normalizados_fuente:
                         mapeo[col_maestro] = normalizados_fuente[variante]
                         break
+            # Fallback: columna del fuente cuyo nombre normalizado empieza por el del maestro
+            # (ej. "Fecha 1er Aporte" -> "Fecha 1er Aporte a endosar"; "1.er" ya unificado en normalizar)
+            if col_maestro not in mapeo:
+                candidatos = [(k, normalizados_fuente[k]) for k in normalizados_fuente if k.startswith(norm_maestro)]
+                # Prefijos alternativos (ej. fuente tiene "Último" y maestro "Last")
+                prefijos_alternativos = {
+                    "fecha last aporte": ["fecha ultimo aporte"],
+                    "fecha corte": ["fecha de corte", "corte"],
+                }
+                if norm_maestro in prefijos_alternativos:
+                    for prefijo in prefijos_alternativos[norm_maestro]:
+                        candidatos.extend(
+                            [(k, normalizados_fuente[k]) for k in normalizados_fuente if k.startswith(prefijo)]
+                        )
+                if candidatos:
+                    # Elegir la coincidencia más específica (nombre más largo)
+                    mejor = max(candidatos, key=lambda x: len(x[0]))
+                    mapeo[col_maestro] = mejor[1]
+            # Fallback columnas de fecha (1er/Last Aporte, Corte): buscar por contenido del nombre
+            if col_maestro not in mapeo:
+                if norm_maestro == "fecha 1er aporte":
+                    candidatos = [(k, normalizados_fuente[k]) for k in normalizados_fuente if "fecha" in k and "aporte" in k and ("1er" in k or "1.er" in k or "primer" in k)]
+                elif norm_maestro == "fecha last aporte":
+                    candidatos = [(k, normalizados_fuente[k]) for k in normalizados_fuente if "fecha" in k and "aporte" in k and ("last" in k or "ultimo" in k)]
+                elif norm_maestro == "fecha corte":
+                    candidatos = [(k, normalizados_fuente[k]) for k in normalizados_fuente if ("fecha" in k and "corte" in k) or k == "corte" or k.startswith("corte ")]
+                else:
+                    candidatos = []
+                if candidatos:
+                    mejor = max(candidatos, key=lambda x: len(x[0]))
+                    mapeo[col_maestro] = mejor[1]
+            # Fallback Tasacion: columna en fuente puede llamarse "Tasación", "Valor Tasación", etc.
+            if col_maestro not in mapeo and norm_maestro == "tasacion":
+                candidatos = [
+                    (k, normalizados_fuente[k]) for k in normalizados_fuente
+                    if "tasacion" in k and "precio" not in k
+                ]
+                if candidatos:
+                    mejor = max(candidatos, key=lambda x: len(x[0]))
+                    mapeo[col_maestro] = mejor[1]
+            # Fallback Monto Crédito + Cap (UF): nombre en fuente puede variar (+/- , espacios)
+            if col_maestro not in mapeo and norm_maestro == "monto credito + cap (uf)":
+                candidatos = [
+                    (k, normalizados_fuente[k]) for k in normalizados_fuente
+                    if "monto credito" in k and "cap" in k and "uf" in k
+                ]
+                if candidatos:
+                    mejor = max(candidatos, key=lambda x: len(x[0]))
+                    mapeo[col_maestro] = mejor[1]
+            # Fallback por índice: columnas del fuente con encabezado vacío (Unnamed)
+            if col_maestro not in mapeo and col_maestro in COLUMNAS_POR_INDICE_FUENTE:
+                idx = COLUMNAS_POR_INDICE_FUENTE[col_maestro]
+                if 0 <= idx < len(df_fuente.columns):
+                    mapeo[col_maestro] = df_fuente.columns[idx]
     return mapeo
 
 
@@ -296,10 +388,11 @@ def imprimir_reporte_mapeo(mapeo: dict, columnas_fuente: list, columnas_fuente_a
         else:
             print(f"  [SIN MAPEAR] {col_maestro!r} (quedará vacío en filas nuevas)")
     print("\n--- Columnas del archivo fuente no usadas ---")
-    sin_uso = [c for c in columnas_fuente if c not in usadas]
-    if sin_uso:
-        for c in sin_uso:
-            print(f"  - {c!r}")
+    print("  (índice = posición 0-based para COLUMNAS_POR_INDICE_FUENTE en cargar_a_maestro.py)")
+    sin_uso_con_indice = [(i, c) for i, c in enumerate(columnas_fuente) if c not in usadas]
+    if sin_uso_con_indice:
+        for idx, c in sin_uso_con_indice:
+            print(f"  - índice {idx}: {c!r}")
     else:
         print("  (ninguna; todas las columnas del fuente se usaron)")
     print("=" * 60 + "\n")
@@ -329,10 +422,11 @@ def rellenar_vpn_desde_columnas_fecha(df_out: pd.DataFrame, df_fuente: pd.DataFr
     - Precio -1UF = valor de la columna de la 2ª fecha menos 1.
     """
     col_1ra, col_2da = obtener_columnas_fecha_vpn(df_fuente)
-    if col_1ra is not None and "VPN 1ra fecha" in df_out.columns:
-        df_out["VPN 1ra fecha"] = df_fuente[col_1ra].values
-    if col_2da is not None and "VPN 2da fecha" in df_out.columns:
-        df_out["VPN 2da fecha"] = df_fuente[col_2da].values
+    # 1ª col. fecha del fuente -> VPN 2da fecha; 2ª col. fecha -> VPN 1ra fecha (según convención del maestro)
+    if col_1ra is not None and "VPN 2da fecha" in df_out.columns:
+        df_out["VPN 2da fecha"] = df_fuente[col_1ra].values
+    if col_2da is not None and "VPN 1ra fecha" in df_out.columns:
+        df_out["VPN 1ra fecha"] = df_fuente[col_2da].values
     # Precio -1UF = valor de la columna de la segunda fecha - 1
     if col_2da is not None and "Precio -1UF" in df_out.columns:
         serie = df_fuente[col_2da].astype(str).str.replace(",", ".", regex=False)
@@ -355,6 +449,37 @@ def dataframe_fuente_a_formato_maestro(df_fuente: pd.DataFrame, mapeo: dict = No
     return df_out
 
 
+def _leer_valo_con_filas_2_y_3(ruta_fuente: str) -> pd.DataFrame:
+    """
+    Lee la hoja Valo sin usar una fila fija como encabezado; construye los nombres
+    de columna desde las filas 2 y 3 (Excel): para cada columna usa el valor de
+    la fila 3 si no está vacío, si no el de la fila 2. Los datos empiezan en la fila 4.
+    """
+    try:
+        df_raw = pd.read_excel(ruta_fuente, sheet_name=HOJA_VALO, header=None)
+    except ValueError:
+        df_raw = pd.read_excel(ruta_fuente, sheet_name=0, header=None)
+    if df_raw.empty or len(df_raw) < 3:
+        return pd.DataFrame()
+    # Excel fila 2 = índice 1, Excel fila 3 = índice 2, datos desde fila 4 = índice 3
+    row2 = df_raw.iloc[1]
+    row3 = df_raw.iloc[2]
+    headers = []
+    for i in range(len(df_raw.columns)):
+        v3 = row3.iloc[i]
+        v2 = row2.iloc[i]
+        if pd.notna(v3) and str(v3).strip():
+            headers.append(str(v3).strip())
+        elif pd.notna(v2) and str(v2).strip():
+            headers.append(str(v2).strip())
+        else:
+            headers.append(f"Unnamed: {i}")
+    df_fuente = df_raw.iloc[3:].copy()
+    df_fuente.columns = headers
+    df_fuente.reset_index(drop=True, inplace=True)
+    return df_fuente
+
+
 def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra: str = None) -> None:
     """
     Lee el archivo fuente, lo mapea al formato maestro, lo concatena al maestro
@@ -364,19 +489,22 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
     if not os.path.isfile(ruta_fuente):
         raise FileNotFoundError(f"No se encontró el archivo fuente: {ruta_fuente}")
 
-    # Leer hoja Valo (datos principales); si no existe, usar la primera
-    try:
-        df_fuente = pd.read_excel(ruta_fuente, sheet_name=HOJA_VALO)
-    except ValueError:
-        df_fuente = pd.read_excel(ruta_fuente, sheet_name=0)
+    # Leer hoja Valo (datos principales)
+    if USAR_FILAS_2_Y_3_VALO:
+        df_fuente = _leer_valo_con_filas_2_y_3(ruta_fuente)
+    else:
+        try:
+            df_fuente = pd.read_excel(ruta_fuente, sheet_name=HOJA_VALO, header=FILA_ENCABEZADO_VALO)
+        except ValueError:
+            df_fuente = pd.read_excel(ruta_fuente, sheet_name=0, header=FILA_ENCABEZADO_VALO)
     if df_fuente.empty:
         print("El archivo fuente no tiene filas en la hoja de datos. No se agrega nada.")
         return
 
-    # Leer hoja Base (para columnas adicionales)
+    # Leer hoja Base (para columnas adicionales); nombres de columna en fila 1
     df_base = None
     try:
-        df_base = pd.read_excel(ruta_fuente, sheet_name=HOJA_BASE)
+        df_base = pd.read_excel(ruta_fuente, sheet_name=HOJA_BASE, header=FILA_ENCABEZADO_BASE)
     except ValueError:
         pass  # No hay hoja Base o tiene otro nombre
 
@@ -423,9 +551,38 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
     # Reordenar por si acaso
     df_sin_duplicados = df_sin_duplicados[COLUMNAS_MAESTRO]
 
+    # Fecha de emisión: solo fecha, sin hora
+    if "Fecha de emisión" in df_sin_duplicados.columns:
+        df_sin_duplicados["Fecha de emisión"] = (
+            pd.to_datetime(df_sin_duplicados["Fecha de emisión"], errors="coerce").dt.normalize()
+        )
+
+    # Columnas de tasa que deben mostrarse en porcentaje (Tasa endoso = Tasa Venta; Tasa Arriendo también)
+    COLUMNAS_PORCENTAJE = ("Tasa Arriendo o Compra", "Tasa Venta", "Dif. Tasa")
+    COLUMNA_FECHA_EMISION = "Fecha de emisión"
+
     # Guardar (cabecera en fila 2 para mantener formato del maestro)
     with pd.ExcelWriter(ruta_maestro, engine="openpyxl") as writer:
         df_sin_duplicados.to_excel(writer, index=False, sheet_name="Sheet1", startrow=1)
+        ws = writer.sheets["Sheet1"]
+        for col_name in COLUMNAS_PORCENTAJE:
+            if col_name not in df_sin_duplicados.columns:
+                continue
+            col_idx = df_sin_duplicados.columns.get_loc(col_name) + 1
+            col_letter = get_column_letter(col_idx)
+            for row in range(2, len(df_sin_duplicados) + 2):
+                cell = ws[f"{col_letter}{row}"]
+                val = cell.value
+                if isinstance(val, (int, float)) and not pd.isna(val):
+                    if abs(val) > 1:
+                        cell.value = val / 100
+                    cell.number_format = "0.00%"
+        # Fecha de emisión: formato solo fecha (sin hora)
+        if COLUMNA_FECHA_EMISION in df_sin_duplicados.columns:
+            col_idx = df_sin_duplicados.columns.get_loc(COLUMNA_FECHA_EMISION) + 1
+            col_letter = get_column_letter(col_idx)
+            for row in range(2, len(df_sin_duplicados) + 2):
+                ws[f"{col_letter}{row}"].number_format = "dd/mm/yyyy"
     print(f"Maestro actualizado: {ruta_maestro}")
     print(f"  Filas en maestro antes: {len(df_maestro)}")
     print(f"  Filas nuevas leídas: {len(df_nuevo)}")

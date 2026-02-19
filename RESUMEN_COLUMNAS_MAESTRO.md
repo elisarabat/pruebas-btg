@@ -8,8 +8,8 @@ Este documento describe **cada columna del Excel maestro** y de dónde se obtien
 
 | Origen | Descripción |
 |--------|-------------|
-| **Valo** | Hoja principal del Excel fuente. Las columnas se mapean por nombre (o por variantes similares). |
-| **Base** | Segunda hoja del mismo Excel. Se enlaza por **Rut**; solo 3 columnas del maestro vienen de aquí. |
+| **Valo** | Hoja principal del Excel fuente. Los nombres de columna están en la **fila 3**. Las columnas se mapean por nombre (o por variantes similares). |
+| **Base** | Segunda hoja del mismo Excel. Los nombres de columna están en la **fila 1**. Se enlaza por **Rut**; solo 3 columnas del maestro vienen de aquí. |
 | **Input** | Valor ingresado por consola al ejecutar el script (ej. Fecha de compra). |
 | **Calculado** | Se calcula a partir de otras columnas ya rellenadas en el maestro. |
 | **Col. fecha** | Viene de columnas de Valo cuyo **encabezado es una fecha** (1ª y 2ª por orden cronológico). |
@@ -30,7 +30,7 @@ Este documento describe **cada columna del Excel maestro** y de dónde se obtien
 | 8 | Rut | Valo | Mapeo desde Valo (rut, run, rut cliente). Se usa como llave para enlazar con Base. |
 | 9 | DV | Valo | Mapeo desde Valo (dv, digito verificador). |
 | 10 | Fecha de emisión | **Base** | Hoja **Base**, columna **Fecha de suscripción** (match por Rut). |
-| 11 | Monto Crédito - Cap (UF) | Valo | Mapeo desde Valo (monto credito, credito uf, monto cap, etc.). |
+| 11 | Monto Crédito + Cap (UF) | Valo | Mapeo desde Valo (monto credito, credito uf, monto cap, etc.). |
 | 12 | Subsidio | Valo | Mapeo desde Valo. |
 | 13 | Pie | Valo | Mapeo desde Valo (pie, pie inicial). |
 | 14 | Valor Vivienda | Valo | Mapeo desde Valo (valor vivienda, valor propiedad, etc.). |
