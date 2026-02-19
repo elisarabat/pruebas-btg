@@ -143,6 +143,30 @@ def _buscar_columna_en_df(df: pd.DataFrame, nombre: str) -> str | None:
     return None
 
 
+def _normalizar_rut_para_merge(val) -> str:
+    """
+    Normaliza un RUT para comparación: quita puntos y deja formato '12345678-9'.
+    Acepta RUT con guion y DV (ej. '12.345.678-9') o solo número.
+    """
+    if pd.isna(val):
+        return ""
+    s = str(val).strip().replace(".", "").upper()
+    return s
+
+
+def _construir_llave_rut_desde_separados(rut_serie: pd.Series, dv_serie: pd.Series) -> pd.Series:
+    """
+    Construye una llave RUT normalizada desde columnas Rut y DV separadas (hoja Valo).
+    Formato resultado: '12345678-9' (sin puntos, DV en mayúscula).
+    """
+    rut = rut_serie.astype(str).str.replace(".", "", regex=False).str.strip()
+    dv = dv_serie.astype(str).str.strip().str.upper()
+    llave = rut + "-" + dv
+    # Evitar que valores con nan coincidan con algo en Base
+    llave = llave.replace(["nan-nan", "nan-NAN", "NaN-NaN"], "")
+    return llave
+
+
 def rellenar_desde_hoja_base(df_out: pd.DataFrame, df_base: pd.DataFrame) -> None:
     """
     Rellena las columnas definidas en COLUMNAS_DESDE_BASE con los valores de la hoja Base,
@@ -168,9 +192,14 @@ def rellenar_desde_hoja_base(df_out: pd.DataFrame, df_base: pd.DataFrame) -> Non
             mapeo_base_a_maestro[col_base_real] = col_maestro
     cols_base = list(dict.fromkeys(cols_base))
     df_lookup = df_base[cols_base].drop_duplicates(subset=[llave_base], keep="first")
-    # Normalizar llave para el merge (ambos a string)
-    df_out["_llave_merge_"] = df_out[llave_maestro].astype(str).str.strip()
-    df_lookup["_llave_merge_"] = df_lookup[llave_base].astype(str).str.strip()
+
+    # Normalizar llave para el merge: en Valo Rut y DV suelen estar separados; en Base vienen "12345678-9"
+    if llave_maestro == "Rut" and "DV" in df_out.columns:
+        df_out["_llave_merge_"] = _construir_llave_rut_desde_separados(df_out["Rut"], df_out["DV"])
+    else:
+        df_out["_llave_merge_"] = df_out[llave_maestro].apply(_normalizar_rut_para_merge)
+
+    df_lookup["_llave_merge_"] = df_lookup[llave_base].apply(_normalizar_rut_para_merge)
     merged = df_out[["_llave_merge_"]].merge(
         df_lookup.drop(columns=[llave_base]),
         on="_llave_merge_",
