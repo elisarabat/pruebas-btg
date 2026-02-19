@@ -139,14 +139,18 @@ def _parsear_nombre_como_fecha(nombre) -> pd.Timestamp | None:
         return None
 
 
-def obtener_columnas_fecha_vpn(df_fuente: pd.DataFrame) -> tuple:
+def obtener_columnas_fecha_vpn(df_fuente: pd.DataFrame, columnas_excluir: set = None) -> tuple:
     """
     Encuentra columnas del fuente cuyo encabezado es una fecha.
     Devuelve (col_primera_fecha, col_segunda_fecha) ordenadas por fecha ascendente
     (la segunda fecha siempre será mayor que la primera). Si hay menos de 2, devuelve None.
+    columnas_excluir: columnas ya mapeadas a otras columnas del maestro (no son VPN).
     """
+    excluir = columnas_excluir or set()
     candidatos = []
     for col in df_fuente.columns:
+        if col in excluir:
+            continue
         d = _parsear_nombre_como_fecha(col)
         if d is not None and not pd.isna(d):
             candidatos.append((col, d))
@@ -201,6 +205,21 @@ def _maestro_a_columnas_estandar(df_maestro: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _rut_valor_a_str(val) -> str:
+    """Convierte un valor de RUT a string limpio, manejando floats (12345678.0 → '12345678')."""
+    if pd.isna(val):
+        return "nan"
+    if isinstance(val, float) and val == int(val):
+        return str(int(val))
+    s = str(val).strip()
+    if s.replace(".", "", 1).isdigit() and "." in s and not s.startswith("0"):
+        try:
+            return str(int(float(s)))
+        except (ValueError, OverflowError):
+            pass
+    return s.replace(".", "")
+
+
 def _normalizar_rut_para_merge(val) -> str:
     """
     Normaliza un RUT para comparación: quita puntos y deja formato '12345678-9'.
@@ -208,6 +227,8 @@ def _normalizar_rut_para_merge(val) -> str:
     """
     if pd.isna(val):
         return ""
+    if isinstance(val, float) and val == int(val):
+        return str(int(val)).upper()
     s = str(val).strip().replace(".", "").upper()
     return s
 
@@ -217,11 +238,10 @@ def _construir_llave_rut_desde_separados(rut_serie: pd.Series, dv_serie: pd.Seri
     Construye una llave RUT normalizada desde columnas Rut y DV separadas (hoja Valo).
     Formato resultado: '12345678-9' (sin puntos, DV en mayúscula).
     """
-    rut = rut_serie.astype(str).str.replace(".", "", regex=False).str.strip()
+    rut = rut_serie.apply(_rut_valor_a_str)
     dv = dv_serie.astype(str).str.strip().str.upper()
     llave = rut + "-" + dv
-    # Evitar que valores con nan coincidan con algo en Base
-    llave = llave.replace(["nan-nan", "nan-NAN", "NaN-NaN"], "")
+    llave = llave.replace(["nan-nan", "nan-NAN", "NaN-NaN", "nan-NaN"], "")
     return llave
 
 
@@ -266,7 +286,9 @@ def rellenar_desde_hoja_base(df_out: pd.DataFrame, df_base: pd.DataFrame) -> Non
     )
     for col_base_real, col_maestro in mapeo_base_a_maestro.items():
         if col_base_real in merged.columns:
-            df_out[col_maestro] = merged[col_base_real].values
+            base_vals = pd.Series(merged[col_base_real].values, index=df_out.index)
+            mask_valido = base_vals.notna()
+            df_out.loc[mask_valido, col_maestro] = base_vals[mask_valido]
     df_out.drop(columns=["_llave_merge_"], inplace=True)
 
 
@@ -378,6 +400,16 @@ def mapear_columnas_fuente_a_maestro(df_fuente: pd.DataFrame) -> dict:
                 if candidatos:
                     mejor = max(candidatos, key=lambda x: len(x[0]))
                     mapeo[col_maestro] = mejor[1]
+            # Fallback Saldo insoluto: la cabecera en el fuente puede ser solo la fecha "31-07-2019"
+            if col_maestro not in mapeo and "saldo insoluto" in norm_maestro:
+                candidatos = [
+                    (k, normalizados_fuente[k]) for k in normalizados_fuente
+                    if ("saldo" in k and "insoluto" in k)
+                    or "31-07-2019" in k or "31/07/2019" in k
+                ]
+                if candidatos:
+                    mejor = max(candidatos, key=lambda x: len(x[0]))
+                    mapeo[col_maestro] = mejor[1]
             # Fallback por índice: columnas del fuente con encabezado vacío (Unnamed)
             if col_maestro not in mapeo and col_maestro in COLUMNAS_POR_INDICE_FUENTE:
                 idx = COLUMNAS_POR_INDICE_FUENTE[col_maestro]
@@ -440,19 +472,23 @@ def aplicar_columnas_calculadas(df_out: pd.DataFrame) -> None:
         df_out["Dif. Tasa"] = tasa_arriendo - tasa_venta
 
 
-def rellenar_vpn_desde_columnas_fecha(df_out: pd.DataFrame, df_fuente: pd.DataFrame) -> None:
+def rellenar_vpn_desde_columnas_fecha(
+    df_out: pd.DataFrame,
+    df_fuente: pd.DataFrame,
+    col_1ra: str = None,
+    col_2da: str = None,
+) -> None:
     """
     Rellena 'VPN 1ra fecha', 'VPN 2da fecha' y 'Precio -1UF' desde el fuente:
     - VPN 1ra/2da = columnas cuyo encabezado es la 1ª y 2ª fecha (orden cronológico).
     - Precio -1UF = valor de la columna de la 2ª fecha menos 1.
     """
-    col_1ra, col_2da = obtener_columnas_fecha_vpn(df_fuente)
-    # 1ª col. fecha del fuente -> VPN 2da fecha; 2ª col. fecha -> VPN 1ra fecha (según convención del maestro)
-    if col_1ra is not None and "VPN 2da fecha" in df_out.columns:
-        df_out["VPN 2da fecha"] = df_fuente[col_1ra].values
-    if col_2da is not None and "VPN 1ra fecha" in df_out.columns:
-        df_out["VPN 1ra fecha"] = df_fuente[col_2da].values
-    # Precio -1UF = valor de la columna de la segunda fecha - 1
+    if col_1ra is None and col_2da is None:
+        col_1ra, col_2da = obtener_columnas_fecha_vpn(df_fuente)
+    if col_1ra is not None and "VPN 1ra fecha" in df_out.columns:
+        df_out["VPN 1ra fecha"] = df_fuente[col_1ra].values
+    if col_2da is not None and "VPN 2da fecha" in df_out.columns:
+        df_out["VPN 2da fecha"] = df_fuente[col_2da].values
     if col_2da is not None and "Precio -1UF" in df_out.columns:
         serie = df_fuente[col_2da].astype(str).str.replace(",", ".", regex=False)
         valores = pd.to_numeric(serie, errors="coerce")
@@ -480,7 +516,12 @@ def _convertir_columna_a_fecha(serie: pd.Series) -> pd.Series:
     return pd.to_datetime(serie, dayfirst=True, errors="coerce").dt.normalize()
 
 
-def dataframe_fuente_a_formato_maestro(df_fuente: pd.DataFrame, mapeo: dict = None) -> pd.DataFrame:
+def dataframe_fuente_a_formato_maestro(
+    df_fuente: pd.DataFrame,
+    mapeo: dict = None,
+    col_vpn_1ra: str = None,
+    col_vpn_2da: str = None,
+) -> pd.DataFrame:
     """Construye un DataFrame con las columnas del maestro, rellenando desde el fuente según mapeo."""
     if mapeo is None:
         mapeo = mapear_columnas_fuente_a_maestro(df_fuente)
@@ -490,12 +531,10 @@ def dataframe_fuente_a_formato_maestro(df_fuente: pd.DataFrame, mapeo: dict = No
             df_out[col_maestro] = df_fuente[mapeo[col_maestro]].values
         else:
             df_out[col_maestro] = pd.NA
-    # Convertir columnas de fecha para que no queden en blanco (texto o número serial Excel → datetime)
     for col in COLUMNAS_FECHA:
         if col in df_out.columns:
             df_out[col] = _convertir_columna_a_fecha(df_out[col])
-    aplicar_columnas_calculadas(df_out)
-    rellenar_vpn_desde_columnas_fecha(df_out, df_fuente)
+    rellenar_vpn_desde_columnas_fecha(df_out, df_fuente, col_1ra=col_vpn_1ra, col_2da=col_vpn_2da)
     return df_out
 
 
@@ -560,15 +599,21 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
 
     # Mapeo y reporte
     mapeo = mapear_columnas_fuente_a_maestro(df_fuente)
-    col_1ra, col_2da = obtener_columnas_fecha_vpn(df_fuente)
+    columnas_ya_mapeadas = set(mapeo.values())
+    col_1ra, col_2da = obtener_columnas_fecha_vpn(df_fuente, columnas_excluir=columnas_ya_mapeadas)
     imprimir_reporte_mapeo(mapeo, list(df_fuente.columns), columnas_fuente_adicionales_usadas=(col_1ra, col_2da))
 
     # Convertir al formato del maestro (desde Valo)
-    df_nuevo = dataframe_fuente_a_formato_maestro(df_fuente, mapeo=mapeo)
+    df_nuevo = dataframe_fuente_a_formato_maestro(
+        df_fuente, mapeo=mapeo, col_vpn_1ra=col_1ra, col_vpn_2da=col_2da
+    )
 
     # Rellenar 3 columnas desde la hoja Base (enlace por Rut u otra llave)
     if df_base is not None and not df_base.empty and COLUMNAS_DESDE_BASE:
         rellenar_desde_hoja_base(df_nuevo, df_base)
+
+    # Calcular columnas derivadas DESPUÉS de rellenar desde Base
+    aplicar_columnas_calculadas(df_nuevo)
 
     # Fecha de compra como input: se aplica a todas las filas nuevas
     if fecha_compra is not None and fecha_compra.strip():
@@ -587,13 +632,27 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
     df_combinado = pd.concat([df_maestro, df_nuevo], ignore_index=True)
 
     # Normalizar llave para deduplicar (Rut + Fecha de emisión)
+    def _normalizar_fecha_str(val):
+        if pd.isna(val):
+            return ""
+        try:
+            return pd.to_datetime(val, dayfirst=True, errors="coerce").strftime("%Y-%m-%d")
+        except Exception:
+            return str(val).strip()
+
     def llave(r):
-        rut = r["Rut"] if pd.notna(r["Rut"]) else ""
-        fec = r["Fecha de emisión"] if pd.notna(r["Fecha de emisión"]) else ""
-        return (str(rut).strip(), str(fec).strip())
+        rut_val = r["Rut"]
+        fec_val = r["Fecha de emisión"]
+        rut = _rut_valor_a_str(rut_val) if pd.notna(rut_val) else ""
+        fec = _normalizar_fecha_str(fec_val)
+        return (rut, fec)
 
     df_combinado["_llave_"] = df_combinado.apply(llave, axis=1)
-    df_sin_duplicados = df_combinado.drop_duplicates(subset=["_llave_"], keep="first")
+    # No deduplicar filas donde Rut o Fecha de emisión están vacíos
+    tiene_llave = df_combinado["_llave_"].apply(lambda x: x[0] != "" and x[1] != "")
+    df_con_llave = df_combinado[tiene_llave].drop_duplicates(subset=["_llave_"], keep="first")
+    df_sin_llave = df_combinado[~tiene_llave]
+    df_sin_duplicados = pd.concat([df_con_llave, df_sin_llave], ignore_index=True)
     df_sin_duplicados = df_sin_duplicados.drop(columns=["_llave_"])
 
     # Reordenar por si acaso
@@ -612,25 +671,27 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
     with pd.ExcelWriter(ruta_maestro, engine="openpyxl") as writer:
         df_sin_duplicados.to_excel(writer, index=False, sheet_name="Sheet1", startrow=1)
         ws = writer.sheets["Sheet1"]
+        n_filas = len(df_sin_duplicados)
+        fila_inicio_datos = 3  # startrow=1 → header fila 2, datos desde fila 3
+        fila_fin_datos = fila_inicio_datos + n_filas  # exclusive
         for col_name in COLUMNAS_PORCENTAJE:
             if col_name not in df_sin_duplicados.columns:
                 continue
             col_idx = df_sin_duplicados.columns.get_loc(col_name) + 1
             col_letter = get_column_letter(col_idx)
-            for row in range(2, len(df_sin_duplicados) + 2):
+            for row in range(fila_inicio_datos, fila_fin_datos):
                 cell = ws[f"{col_letter}{row}"]
                 val = cell.value
                 if isinstance(val, (int, float)) and not pd.isna(val):
                     if abs(val) > 1:
                         cell.value = val / 100
                     cell.number_format = "0.00%"
-        # Todas las columnas de fecha: formato dd/mm/yyyy para que se vean en Excel
         for col_name in COLUMNAS_FECHA:
             if col_name not in df_sin_duplicados.columns:
                 continue
             col_idx = df_sin_duplicados.columns.get_loc(col_name) + 1
             col_letter = get_column_letter(col_idx)
-            for row in range(2, len(df_sin_duplicados) + 2):
+            for row in range(fila_inicio_datos, fila_fin_datos):
                 ws[f"{col_letter}{row}"].number_format = "dd/mm/yyyy"
     print(f"Maestro actualizado: {ruta_maestro}")
     print(f"  Filas en maestro antes: {len(df_maestro)}")
