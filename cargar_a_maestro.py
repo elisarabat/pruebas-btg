@@ -55,6 +55,15 @@ COLUMNAS_POR_INDICE_FUENTE = {
     "Carga Financiera": 27,
 }
 
+# Columnas que son fechas: se convierten a datetime al leer y se formatean al escribir
+COLUMNAS_FECHA = (
+    "Fecha de compra",
+    "Fecha de emisión",
+    "Fecha 1er Aporte",
+    "Fecha Last Aporte",
+    "Fecha Corte",
+)
+
 # Columnas del archivo maestro (orden exacto)
 COLUMNAS_MAESTRO = [
     "Fecha de compra",
@@ -174,6 +183,22 @@ def _buscar_columna_en_df(df: pd.DataFrame, nombre: str) -> str | None:
         if normalizar_nombre(c) == norm:
             return c
     return None
+
+
+def _maestro_a_columnas_estandar(df_maestro: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convierte el DataFrame leído del maestro a uno con columnas exactamente COLUMNAS_MAESTRO,
+    mapeando por nombre normalizado. Así no se pierden datos de filas ya existentes cuando
+    el Excel tiene nombres con espacios extra, acentos distintos, etc.
+    """
+    out = pd.DataFrame(index=df_maestro.index)
+    for col_maestro in COLUMNAS_MAESTRO:
+        col_real = _buscar_columna_en_df(df_maestro, col_maestro)
+        if col_real is not None:
+            out[col_maestro] = df_maestro[col_real].values
+        else:
+            out[col_maestro] = pd.NA
+    return out
 
 
 def _normalizar_rut_para_merge(val) -> str:
@@ -434,6 +459,27 @@ def rellenar_vpn_desde_columnas_fecha(df_out: pd.DataFrame, df_fuente: pd.DataFr
         df_out["Precio -1UF"] = valores - 1
 
 
+def _convertir_columna_a_fecha(serie: pd.Series) -> pd.Series:
+    """Convierte una serie a datetime; acepta texto dd/mm/yyyy, números serial Excel y datetime."""
+    if serie.empty:
+        return serie
+    # Si ya es datetime64, solo normalizar
+    if pd.api.types.is_datetime64_any_dtype(serie):
+        return pd.to_datetime(serie, errors="coerce").dt.normalize()
+    # Números que parecen serial Excel (días desde 1899-12-30): típicamente 1000–100000
+    numeric = pd.to_numeric(serie, errors="coerce")
+    if numeric.notna().any():
+        sample = numeric.dropna()
+        if (sample >= 1000).all() and (sample <= 100000).all():
+            try:
+                fechas = pd.TimedeltaIndex(numeric.astype(float), unit="d") + pd.Timestamp("1899-12-30")
+                return pd.Series(fechas.normalize(), index=serie.index)
+            except (ValueError, TypeError):
+                pass
+    # Texto o resto: convertir (dayfirst para formato chileno dd/mm/yyyy)
+    return pd.to_datetime(serie, dayfirst=True, errors="coerce").dt.normalize()
+
+
 def dataframe_fuente_a_formato_maestro(df_fuente: pd.DataFrame, mapeo: dict = None) -> pd.DataFrame:
     """Construye un DataFrame con las columnas del maestro, rellenando desde el fuente según mapeo."""
     if mapeo is None:
@@ -444,6 +490,10 @@ def dataframe_fuente_a_formato_maestro(df_fuente: pd.DataFrame, mapeo: dict = No
             df_out[col_maestro] = df_fuente[mapeo[col_maestro]].values
         else:
             df_out[col_maestro] = pd.NA
+    # Convertir columnas de fecha para que no queden en blanco (texto o número serial Excel → datetime)
+    for col in COLUMNAS_FECHA:
+        if col in df_out.columns:
+            df_out[col] = _convertir_columna_a_fecha(df_out[col])
     aplicar_columnas_calculadas(df_out)
     rellenar_vpn_desde_columnas_fecha(df_out, df_fuente)
     return df_out
@@ -526,12 +576,10 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
 
     # Leer maestro existente (los nombres de columna están en la fila 2 del Excel)
     if os.path.isfile(ruta_maestro):
-        df_maestro = pd.read_excel(ruta_maestro, sheet_name=0, header=1)
-        # Asegurar mismo orden de columnas
-        for c in COLUMNAS_MAESTRO:
-            if c not in df_maestro.columns:
-                df_maestro[c] = pd.NA
-        df_maestro = df_maestro[COLUMNAS_MAESTRO]
+        df_maestro_raw = pd.read_excel(ruta_maestro, sheet_name=0, header=1)
+        # Mapear por nombre normalizado para no perder datos de filas ya existentes
+        # (si el Excel tiene "Comuna " o "Morosidad " con espacio, se reconoce igual)
+        df_maestro = _maestro_a_columnas_estandar(df_maestro_raw)
     else:
         df_maestro = pd.DataFrame(columns=COLUMNAS_MAESTRO)
 
@@ -559,7 +607,6 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
 
     # Columnas de tasa que deben mostrarse en porcentaje (Tasa endoso = Tasa Venta; Tasa Arriendo también)
     COLUMNAS_PORCENTAJE = ("Tasa Arriendo o Compra", "Tasa Venta", "Dif. Tasa")
-    COLUMNA_FECHA_EMISION = "Fecha de emisión"
 
     # Guardar (cabecera en fila 2 para mantener formato del maestro)
     with pd.ExcelWriter(ruta_maestro, engine="openpyxl") as writer:
@@ -577,9 +624,11 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
                     if abs(val) > 1:
                         cell.value = val / 100
                     cell.number_format = "0.00%"
-        # Fecha de emisión: formato solo fecha (sin hora)
-        if COLUMNA_FECHA_EMISION in df_sin_duplicados.columns:
-            col_idx = df_sin_duplicados.columns.get_loc(COLUMNA_FECHA_EMISION) + 1
+        # Todas las columnas de fecha: formato dd/mm/yyyy para que se vean en Excel
+        for col_name in COLUMNAS_FECHA:
+            if col_name not in df_sin_duplicados.columns:
+                continue
+            col_idx = df_sin_duplicados.columns.get_loc(col_name) + 1
             col_letter = get_column_letter(col_idx)
             for row in range(2, len(df_sin_duplicados) + 2):
                 ws[f"{col_letter}{row}"].number_format = "dd/mm/yyyy"
