@@ -5,6 +5,7 @@ Script para cargar datos desde archivos Excel fuente hacia un archivo maestro.
 - Mapea columnas aunque los nombres no coincidan exactamente.
 """
 
+import datetime
 import pandas as pd
 import sys
 import os
@@ -144,8 +145,8 @@ def _parsear_nombre_como_fecha(nombre) -> pd.Timestamp | None:
 def obtener_columnas_fecha_vpn(df_fuente: pd.DataFrame, columnas_excluir: set = None) -> tuple:
     """
     Encuentra columnas del fuente cuyo encabezado es una fecha.
-    Devuelve (col_primera_fecha, col_segunda_fecha) ordenadas por fecha ascendente
-    (la segunda fecha siempre será mayor que la primera). Si hay menos de 2, devuelve None.
+    Devuelve (col_primera, col_segunda) en orden de aparición en el archivo
+    (la primera columna fecha que aparece es la 1ra, la siguiente es la 2da).
     columnas_excluir: columnas ya mapeadas a otras columnas del maestro (no son VPN).
     """
     excluir = columnas_excluir or set()
@@ -155,12 +156,13 @@ def obtener_columnas_fecha_vpn(df_fuente: pd.DataFrame, columnas_excluir: set = 
             continue
         d = _parsear_nombre_como_fecha(col)
         if d is not None and not pd.isna(d):
-            candidatos.append((col, d))
-    candidatos.sort(key=lambda x: x[1])
+            candidatos.append(col)
+        if len(candidatos) == 2:
+            break
     if len(candidatos) >= 2:
-        return candidatos[0][0], candidatos[1][0]
+        return candidatos[0], candidatos[1]
     if len(candidatos) == 1:
-        return candidatos[0][0], None
+        return candidatos[0], None
     return None, None
 
 
@@ -325,7 +327,7 @@ def mapear_columnas_fuente_a_maestro(df_fuente: pd.DataFrame) -> dict:
             variantes = {
                 "fecha de compra": ["fecha compra", "fecha_compra", "fechacompra"],
                 "n°": ["n", "numero", "num", "nº", "no"],
-                "n° op": ["n op", "n op.", "numero op", "nop", "n° operacion"],
+                "n° op": ["n op", "n op.", "numero op", "nop", "n° operacion", "op"],
                 "id blotter": ["id blotter", "id_blotter", "blotter"],
                 "apellido paterno": ["apellido paterno", "ap paterno", "paterno"],
                 "apellido materno": ["apellido materno", "ap materno", "materno"],
@@ -609,31 +611,52 @@ def _leer_valo_con_filas_2_y_3(ruta_fuente: str) -> pd.DataFrame:
 
 def _leer_maestro_como_dataframe(ruta_maestro: str) -> pd.DataFrame:
     """
-    Lee el maestro construyendo los encabezados desde filas 1 y 2 (pueden estar
-    en celdas combinadas). Para cada columna usa el valor de fila 2 si existe,
-    si no el de fila 1. Los datos empiezan en fila 3.
-    Devuelve un DataFrame con columnas estandarizadas a COLUMNAS_MAESTRO.
+    Lee solo las columnas 'Rut' y 'Fecha de emisión' del maestro usando openpyxl
+    para evitar cargar todo el archivo (puede ser muy grande).
+    Devuelve un DataFrame con al menos esas dos columnas.
     """
-    df_raw = pd.read_excel(ruta_maestro, sheet_name=0, header=None)
-    if df_raw.empty or len(df_raw) < 3:
+    wb = load_workbook(ruta_maestro, read_only=True, data_only=True)
+    if "Detalle Compras" in wb.sheetnames:
+        ws = wb["Detalle Compras"]
+    else:
+        ws = wb[wb.sheetnames[0]]
+
+    n_cols = min(ws.max_column, len(COLUMNAS_MAESTRO) + 10)
+
+    headers = {}
+    for ci in range(1, n_cols + 1):
+        v2 = ws.cell(row=2, column=ci).value
+        v1 = ws.cell(row=1, column=ci).value
+        nombre = str(v2).strip() if v2 is not None else (str(v1).strip() if v1 is not None else None)
+        if nombre:
+            norm = normalizar_nombre(nombre)
+            if normalizar_nombre("Rut") == norm:
+                headers["Rut"] = ci
+            elif normalizar_nombre("Fecha de emisión") == norm:
+                headers["Fecha de emisión"] = ci
+
+    col_rut = headers.get("Rut")
+    col_fecha = headers.get("Fecha de emisión")
+
+    if col_rut is None and col_fecha is None:
+        for i, cm in enumerate(COLUMNAS_MAESTRO):
+            if cm == "Rut":
+                col_rut = i + 1
+            elif cm == "Fecha de emisión":
+                col_fecha = i + 1
+
+    rows = []
+    for fila in range(3, ws.max_row + 1):
+        rut_val = ws.cell(row=fila, column=col_rut).value if col_rut else None
+        fecha_val = ws.cell(row=fila, column=col_fecha).value if col_fecha else None
+        if rut_val is not None or fecha_val is not None:
+            rows.append({"Rut": rut_val, "Fecha de emisión": fecha_val})
+
+    wb.close()
+
+    if not rows:
         return pd.DataFrame(columns=COLUMNAS_MAESTRO)
-    row1 = df_raw.iloc[0]
-    row2 = df_raw.iloc[1]
-    n_cols = min(len(df_raw.columns), len(COLUMNAS_MAESTRO) + 10)
-    headers = []
-    for i in range(n_cols):
-        v2 = row2.iloc[i] if i < len(row2) else None
-        v1 = row1.iloc[i] if i < len(row1) else None
-        if pd.notna(v2) and str(v2).strip():
-            headers.append(str(v2).strip())
-        elif pd.notna(v1) and str(v1).strip():
-            headers.append(str(v1).strip())
-        else:
-            headers.append(f"Unnamed: {i}")
-    df = df_raw.iloc[2:, :n_cols].copy()
-    df.columns = headers
-    df.reset_index(drop=True, inplace=True)
-    return _maestro_a_columnas_estandar(df)
+    return pd.DataFrame(rows)
 
 
 def _es_na(val) -> bool:
@@ -642,6 +665,15 @@ def _es_na(val) -> bool:
         return pd.isna(val)
     except (ValueError, TypeError):
         return False
+
+
+def _val_para_excel(val):
+    """Convierte pd.NA / NaN / NaT a None para que openpyxl no lance error."""
+    if _es_na(val):
+        return None
+    if isinstance(val, pd.Timestamp):
+        return val.to_pydatetime()
+    return val
 
 
 _ALINEACION_CENTRO = Alignment(horizontal="center", vertical="center")
@@ -679,8 +711,245 @@ def _escribir_celda(ws, fila, col_idx, col_name, val, columnas_porcentaje, colum
         cell.alignment = _ALINEACION_CENTRO
         return
 
-    cell.value = val
+    cell.value = _val_para_excel(val)
     cell.alignment = _ALINEACION_CENTRO
+
+
+def _actualizar_hoja_tablas(wb, df_a_agregar: pd.DataFrame, ultimo_n: int) -> tuple:
+    """
+    Agrega filas a la hoja 'Tablas' correspondientes a las nuevas filas
+    de 'Detalle Compras'. Devuelve (n_agregadas, sig_fila) donde sig_fila
+    es la primera fila donde se empezaron a escribir datos.
+
+    Columnas fijas en Tablas:
+      1=N°, 2=Operación(=N° OP), 3=ID Operación(=ID Blotter),
+      4=V DIV(fórmula), 5=Fecha Inicio(=Fecha 1er Aporte),
+      6=Fecha Final(=Fecha Last Aporte), 7=Cuotas Compradas(fórmula),
+      8=Cuotas remanentes(fórmula)
+    """
+    if "Tablas" not in wb.sheetnames:
+        print("  Hoja 'Tablas' no encontrada en el maestro; se omite.")
+        return (0, 0)
+
+    ws = wb["Tablas"]
+    sig_fila = ws.max_row + 1
+
+    for i, (_, row) in enumerate(df_a_agregar.iterrows()):
+        f = sig_fila + i
+        n_valor = ultimo_n + i + 1
+
+        # Col 1: N°
+        c = ws.cell(row=f, column=1, value=n_valor)
+        c.alignment = _ALINEACION_CENTRO
+
+        # Col 2: Operación (= N° OP)
+        c = ws.cell(row=f, column=2, value=_val_para_excel(row.get("N° OP")))
+        c.alignment = _ALINEACION_CENTRO
+
+        # Col 3: ID Operación (= ID Blotter)
+        val_id = _val_para_excel(row.get("ID Blotter"))
+        if val_id is not None:
+            try:
+                val_id = int(val_id)
+            except (ValueError, TypeError):
+                pass
+        c = ws.cell(row=f, column=3, value=val_id)
+        c.alignment = _ALINEACION_CENTRO
+
+        # Col 4: V DIV — fórmula =IF(B{f}="","",EA{f})
+        c = ws.cell(row=f, column=4, value=f'=IF(B{f}="","",EA{f})')
+        c.alignment = _ALINEACION_CENTRO
+
+        # Col 5: Fecha Inicio (= Fecha 1er Aporte)
+        val_fi = _val_para_excel(row.get("Fecha 1er Aporte"))
+        if val_fi is not None and not isinstance(val_fi, datetime.datetime):
+            try:
+                val_fi = pd.to_datetime(val_fi, dayfirst=True).to_pydatetime()
+            except Exception:
+                pass
+        c = ws.cell(row=f, column=5, value=val_fi)
+        c.number_format = "dd/mm/yyyy"
+        c.alignment = _ALINEACION_CENTRO
+
+        # Col 6: Fecha Final (= Fecha Last Aporte)
+        val_ff = _val_para_excel(row.get("Fecha Last Aporte"))
+        if val_ff is not None and not isinstance(val_ff, datetime.datetime):
+            try:
+                val_ff = pd.to_datetime(val_ff, dayfirst=True).to_pydatetime()
+            except Exception:
+                pass
+        c = ws.cell(row=f, column=6, value=val_ff)
+        c.number_format = "dd/mm/yyyy"
+        c.alignment = _ALINEACION_CENTRO
+
+        # Col 7: Cuotas Compradas — fórmula =COUNTIF(I{f}:ADF{f},">1")
+        c = ws.cell(row=f, column=7, value=f'=COUNTIF(I{f}:ADF{f},">1")')
+        c.alignment = _ALINEACION_CENTRO
+
+        # Col 8: Cuotas remanentes — fórmula =COUNT(AF{f}:ADF{f})
+        c = ws.cell(row=f, column=8, value=f'=COUNT(AF{f}:ADF{f})')
+        c.alignment = _ALINEACION_CENTRO
+
+    n_agregadas = len(df_a_agregar)
+    if n_agregadas > 0:
+        print(f"  Hoja 'Tablas': {n_agregadas} filas agregadas (filas {sig_fila}-{sig_fila + n_agregadas - 1})")
+    return (n_agregadas, sig_fila)
+
+
+def _copiar_tabla_desarrollo_a_tablas(
+    wb_maestro, ruta_maestro: str, ruta_fuente: str,
+    indices_fuente: list, sig_fila_tablas: int
+) -> int:
+    """
+    Lee la hoja 'Tabla desarrollo' del archivo fuente, encuentra las columnas
+    con fecha en fila 1/2, y para cada fecha que también exista en la hoja
+    'Tablas' del maestro, copia los valores de las filas correspondientes.
+    Las celdas vacías se rellenan con 0.
+
+    ruta_maestro: ruta al archivo maestro (se abre en modo data_only para leer
+                  las fórmulas de fecha resueltas).
+    indices_fuente: lista de índices originales del DataFrame fuente (0-based)
+                    que indican qué filas de 'Tabla desarrollo' copiar.
+    sig_fila_tablas: primera fila en 'Tablas' donde se escribirán los datos.
+    """
+    if "Tablas" not in wb_maestro.sheetnames:
+        print("  Hoja 'Tablas' no encontrada; se omite copia de Tabla desarrollo.")
+        return 0
+
+    ws_tablas = wb_maestro["Tablas"]
+
+    try:
+        wb_fuente = load_workbook(ruta_fuente, data_only=True)
+    except Exception as e:
+        print(f"  No se pudo abrir fuente para Tabla desarrollo: {e}")
+        return 0
+
+    hoja_td = None
+    for nombre in wb_fuente.sheetnames:
+        if nombre == "Tabla desarrollo":
+            hoja_td = nombre
+            break
+    if hoja_td is None:
+        for nombre in wb_fuente.sheetnames:
+            nl = nombre.lower()
+            if "tabla" in nl and "desarrollo" in nl and "fx" not in nl:
+                hoja_td = nombre
+                break
+    if hoja_td is None:
+        print("  Hoja 'Tabla desarrollo' no encontrada en el archivo fuente; se omite.")
+        wb_fuente.close()
+        return 0
+
+    ws_td = wb_fuente[hoja_td]
+    print(f"  Hoja fuente '{hoja_td}': {ws_td.max_row} filas x {ws_td.max_column} cols")
+
+    def _to_date_key(val):
+        if isinstance(val, datetime.datetime):
+            return val.date()
+        if isinstance(val, datetime.date):
+            return val
+        return None
+
+    # Las fechas en "Tablas" fila 1 son fórmulas EDATE (=+EDATE(I1,1), etc.).
+    # Después de que openpyxl guarda el archivo, los valores cacheados se
+    # pierden y data_only=True devuelve None. Estrategia:
+    #   1) Intentar data_only (funciona si el archivo fue guardado por Excel).
+    #   2) Si encuentra pocas fechas, calcularlas desde las fórmulas: buscar
+    #      la primera fecha real y luego sumar 1 mes por cada columna EDATE.
+    fechas_tablas = {}
+    try:
+        wb_maestro_ro = load_workbook(ruta_maestro, read_only=True, data_only=True)
+        ws_tablas_ro = wb_maestro_ro["Tablas"]
+        for ci in range(1, ws_tablas_ro.max_column + 1):
+            dk = _to_date_key(ws_tablas_ro.cell(row=1, column=ci).value)
+            if dk is not None:
+                fechas_tablas[dk] = ci
+        wb_maestro_ro.close()
+    except Exception:
+        pass
+
+    if len(fechas_tablas) < 10:
+        fechas_tablas.clear()
+        running_date = None
+        for ci in range(1, ws_tablas.max_column + 1):
+            v = ws_tablas.cell(row=1, column=ci).value
+            if isinstance(v, datetime.datetime):
+                running_date = v
+                fechas_tablas[v.date()] = ci
+            elif isinstance(v, str) and "EDATE" in v.upper():
+                if running_date is not None:
+                    running_date = (
+                        pd.Timestamp(running_date) + pd.DateOffset(months=1)
+                    ).to_pydatetime()
+                    fechas_tablas[running_date.date()] = ci
+
+    if not fechas_tablas:
+        print("  No se encontraron columnas de fecha en 'Tablas' del maestro.")
+        wb_fuente.close()
+        return 0
+
+    primera_fecha_col_td = None
+    fila_fecha_td = None
+    for ci in range(1, ws_td.max_column + 1):
+        for fr in (1, 2):
+            dk = _to_date_key(ws_td.cell(row=fr, column=ci).value)
+            if dk is not None:
+                primera_fecha_col_td = ci
+                fila_fecha_td = fr
+                break
+        if primera_fecha_col_td is not None:
+            break
+
+    if primera_fecha_col_td is None:
+        print("  No se encontraron fechas en 'Tabla desarrollo' del fuente.")
+        wb_fuente.close()
+        return 0
+
+    fila_datos_td = 3 if fila_fecha_td <= 2 else fila_fecha_td + 1
+    print(f"  Tabla desarrollo: fechas en fila {fila_fecha_td}, datos desde fila {fila_datos_td}, "
+          f"primera col fecha={primera_fecha_col_td}")
+    print(f"  Indices fuente a copiar: {indices_fuente[:5]}{'...' if len(indices_fuente) > 5 else ''} "
+          f"({len(indices_fuente)} filas)")
+    print(f"  Fechas en Tablas maestro: {len(fechas_tablas)} columnas")
+
+    celdas_escritas = 0
+    cols_match = 0
+    cols_sin_match = 0
+
+    for ci_td in range(primera_fecha_col_td, ws_td.max_column + 1):
+        dk = _to_date_key(ws_td.cell(row=fila_fecha_td, column=ci_td).value)
+        if dk is None:
+            continue
+        if dk not in fechas_tablas:
+            cols_sin_match += 1
+            continue
+        ci_tablas = fechas_tablas[dk]
+        cols_match += 1
+
+        if cols_match <= 3:
+            print(f"    Match #{cols_match}: fecha={dk} -> TD col {ci_td} -> Tablas col {ci_tablas}")
+
+        for dest_i, src_idx in enumerate(indices_fuente):
+            fila_td = fila_datos_td + src_idx
+            if fila_td > ws_td.max_row:
+                val = 0
+            else:
+                val = ws_td.cell(row=fila_td, column=ci_td).value
+            if val is None:
+                val = 0
+            cell = ws_tablas.cell(row=sig_fila_tablas + dest_i, column=ci_tablas)
+            cell.value = val
+            cell.alignment = _ALINEACION_CENTRO
+            celdas_escritas += 1
+
+    if cols_sin_match > 0:
+        print(f"  Fechas en TD sin columna correspondiente en Tablas: {cols_sin_match}")
+
+    wb_fuente.close()
+    print(f"  Tabla desarrollo -> Tablas: {cols_match} columnas de fecha coincidentes, "
+          f"{celdas_escritas} celdas copiadas (filas {sig_fila_tablas}-"
+          f"{sig_fila_tablas + len(indices_fuente) - 1} en Tablas).")
+    return celdas_escritas
 
 
 def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra: str = None) -> None:
@@ -783,7 +1052,10 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
 
         # Abrir el archivo existente y agregar al final
         wb = load_workbook(ruta_maestro)
-        ws = wb.active
+        if "Detalle Compras" in wb.sheetnames:
+            ws = wb["Detalle Compras"]
+        else:
+            ws = wb.active
 
         # Leer cabeceras: pueden estar en fila 1, fila 2 o celdas combinadas
         n_maestro_cols = len(COLUMNAS_MAESTRO)
@@ -835,6 +1107,16 @@ def cargar_y_agregar_a_maestro(ruta_fuente: str, ruta_maestro: str, fecha_compra
                     ws, fila_excel, col_pos[col_name], col_name, val,
                     COLUMNAS_PORCENTAJE, COLUMNAS_FECHA,
                 )
+
+        # Actualizar hoja Tablas con las mismas filas nuevas
+        n_tablas, sig_fila_tablas = _actualizar_hoja_tablas(wb, df_a_agregar, ultimo_n)
+
+        # Copiar datos de "Tabla desarrollo" (fuente) a columnas de fecha en "Tablas"
+        if n_tablas > 0:
+            indices_fuente = list(df_a_agregar.index)
+            _copiar_tabla_desarrollo_a_tablas(
+                wb, ruta_maestro, ruta_fuente, indices_fuente, sig_fila_tablas
+            )
 
         wb.save(ruta_maestro)
 
